@@ -1,5 +1,8 @@
 use std::{
-    error::Error, io::{self, Read, Write}, net::{SocketAddr, TcpListener, TcpStream}, thread,
+    error::Error,
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    thread,
 };
 
 use tracing::info;
