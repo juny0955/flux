@@ -1,99 +1,87 @@
 use std::{
     error::Error,
-    io::{self, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    io,
+    net::TcpListener,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    ptr,
     thread::{self},
-    time::Duration,
 };
 
+use flux::proxy::handle_client;
+use libc::{EV_ADD, EVFILT_READ, uintptr_t};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/*
+kevent(
+    kq,          // 어느 kqueue에 요청할지
+    changelist,  // 등록·변경할 설정 목록
+    nchanges,    // 설정 개수
+    eventlist,   // 발생한 이벤트를 받을 배열
+    nevents,     // 배열에 받을 수 있는 최대 개수
+    timeout      // 이벤트 대기 제한 시간
+)
+*/
 
 fn main() -> Result<(), Box<dyn Error>> {
     setup();
 
     let listener = TcpListener::bind("127.0.0.1:9000")?;
+    listener.set_nonblocking(true)?;
     info!("9000 port binding completed");
 
-    loop {
-        let (client, addr) = listener.accept()?;
-        info!("client connected: {}", addr);
+    let kq = create_kqueue()?;
+    listener_reg_kqueue(listener.as_raw_fd(), kq.as_raw_fd())?;
 
-        thread::spawn(move || {
-            if let Err(e) = handle_client(client) {
-                error!("client {} error: {}", addr, e);
+    // listener 이벤트 받을 배열 준비
+    let mut events = [libc::kevent {
+        ident: 0,
+        filter: 0,
+        flags: 0,
+        fflags: 0,
+        data: 0,
+        udata: ptr::null_mut(),
+    }; 64];
+
+    let listener_ident = uintptr_t::try_from(listener.as_raw_fd())?;
+    loop {
+        // event 받아올때 까지 대기함
+        println!("listener event 대기");
+        let count = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                64,
+                ptr::null(),
+            )
+        };
+        if count == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
+        println!("listener event 수신");
+
+        for event in &events[..count as usize] {
+            if event.flags & libc::EV_ERROR != 0 {
+                let code = i32::try_from(event.data)?;
+                return Err(io::Error::from_raw_os_error(code).into());
             }
 
-            info!("client disconnected: {}", addr);
-        });
-    }
-}
+            if event.ident == listener_ident && event.filter == libc::EVFILT_READ {
+                let (client, addr) = listener.accept()?;
+                info!("client connected: {}", addr);
 
-fn handle_client(client: TcpStream) -> io::Result<()> {
-    let server =
-        TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], 8080)), CONNECT_TIMEOUT)?;
-    info!("backend connected");
+                thread::spawn(move || {
+                    if let Err(e) = handle_client(client) {
+                        error!("client {} error: {}", addr, e);
+                    }
 
-    server.set_read_timeout(Some(READ_TIMEOUT))?;
-    server.set_write_timeout(Some(WRITE_TIMEOUT))?;
-
-    client.set_read_timeout(Some(READ_TIMEOUT))?;
-    client.set_write_timeout(Some(WRITE_TIMEOUT))?;
-
-    // upstream thread 생성
-    let upstream_client = client.try_clone()?;
-    let upstream_server = server.try_clone()?;
-    let upstream = thread::spawn(move || relay(upstream_client, upstream_server));
-
-    // backend -> client 복사
-    let downstream_result = relay(server, client);
-
-    // upstream thread 종료 대기
-    let upstream_result = upstream
-        .join()
-        .map_err(|_| io::Error::other("upstream thread panicked"))?;
-
-    downstream_result?;
-    upstream_result?;
-
-    Ok(())
-}
-
-fn relay(mut from: TcpStream, mut to: TcpStream) -> io::Result<()> {
-    let mut buf = [0u8; 8192];
-
-    loop {
-        match handle_recv(&mut from, &mut to, &mut buf) {
-            Ok(true) => continue,
-
-            // 정상 EOF
-            Ok(false) => {
-                let _ = to.shutdown(Shutdown::Write);
-                return Ok(());
-            }
-
-            // I/O 오류 연결 종료
-            Err(e) => {
-                let _ = to.shutdown(Shutdown::Both);
-                let _ = from.shutdown(Shutdown::Both);
-                return Err(e);
+                    info!("client disconnected: {}", addr);
+                });
             }
         }
     }
-}
-
-fn handle_recv(from: &mut TcpStream, to: &mut TcpStream, buf: &mut [u8]) -> io::Result<bool> {
-    let n = from.read(buf)?;
-    if n == 0 {
-        return Ok(false);
-    }
-
-    to.write_all(&buf[..n])?;
-    Ok(true)
 }
 
 fn setup() {
@@ -102,4 +90,36 @@ fn setup() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+}
+
+/// kqueue 생성 후 소유권
+fn create_kqueue() -> Result<OwnedFd, io::Error> {
+    // kqueue 생성
+    let kq = unsafe { libc::kqueue() };
+    if kq == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // 소유권 이동
+    Ok(unsafe { OwnedFd::from_raw_fd(kq) })
+}
+
+/// listener kqueue event 등록
+fn listener_reg_kqueue(listener_fd: RawFd, kq_fd: RawFd) -> Result<(), Box<dyn Error>> {
+    // listener event 설정 구조체
+    let change = libc::kevent {
+        ident: uintptr_t::try_from(listener_fd)?,
+        filter: EVFILT_READ,
+        flags: EV_ADD, // 추가
+        fflags: 0,
+        data: 0,
+        udata: ptr::null_mut(),
+    };
+
+    let result = unsafe { libc::kevent(kq_fd, &change, 1, ptr::null_mut(), 0, ptr::null()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    Ok(())
 }
