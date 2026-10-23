@@ -4,7 +4,7 @@ use std::{
     ptr,
 };
 
-use libc::{EV_ADD, EV_DISABLE, EVFILT_READ, EVFILT_WRITE, uintptr_t};
+use libc::{EV_ADD, EV_DISABLE, EV_ENABLE, EVFILT_READ, EVFILT_WRITE, uintptr_t};
 
 /*
 kevent(
@@ -77,7 +77,7 @@ impl Kqueue {
     fn register_event(&self, socket_fd: RawFd, filter: i16) -> io::Result<()> {
         let change = libc::kevent {
             ident: socket_fd as uintptr_t,
-            flags: EV_ADD, // 추가
+            flags: EV_ADD | EV_ENABLE,
             fflags: 0,
             data: 0,
             udata: ptr::null_mut(),
@@ -97,7 +97,7 @@ impl Kqueue {
     fn disable_event(&self, socket_fd: RawFd, filter: i16) -> io::Result<()> {
         let change = libc::kevent {
             ident: socket_fd as uintptr_t,
-            flags: EV_DISABLE, // 추가
+            flags: EV_DISABLE,
             fflags: 0,
             data: 0,
             udata: ptr::null_mut(),

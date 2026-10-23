@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr,
 };
@@ -124,6 +124,14 @@ impl Connection {
         }
     }
 
+    pub fn shutdown_write(&mut self, fd: i32) -> io::Result<()> {
+        if self.is_client_fd(fd) {
+            self.client.shutdown(Shutdown::Write)
+        } else {
+            self.server.shutdown(Shutdown::Write)
+        }
+    }
+
     pub fn peer_fd(&self, fd: i32) -> RawFd {
         if self.is_client_fd(fd) {
             self.server_fd()
@@ -138,6 +146,21 @@ impl Connection {
         } else {
             !self.downstream_buffer.is_empty()
         }
+    }
+
+    pub fn is_eof(&self, fd: i32) -> bool {
+        if self.is_client_fd(fd) {
+            self.client_eof
+        } else {
+            self.server_eof
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.client_eof
+            && self.server_eof
+            && self.upstream_buffer.is_empty()
+            && self.downstream_buffer.is_empty()
     }
 
     pub fn is_client_fd(&self, fd: i32) -> bool {
