@@ -56,6 +56,8 @@ pub struct Connection {
     upstream_buffer: Buffer,
     downstream_buffer: Buffer,
 
+    client_write_enabled: bool,
+    server_write_enabled: bool,
     client_eof: bool,
     server_eof: bool,
 }
@@ -72,6 +74,8 @@ impl Connection {
             state,
             upstream_buffer: Buffer::new(),
             downstream_buffer: Buffer::new(),
+            client_write_enabled: false,
+            server_write_enabled: false,
             client_eof: false,
             server_eof: false,
         })
@@ -116,6 +120,22 @@ impl Connection {
         Ok(())
     }
 
+    pub fn mark_write_enabled(&mut self, fd: i32) {
+        if self.is_client_fd(fd) {
+            self.client_write_enabled = true;
+        } else {
+            self.server_write_enabled = true;
+        }
+    }
+
+    pub fn mark_write_disabled(&mut self, fd: i32) {
+        if self.is_client_fd(fd) {
+            self.client_write_enabled = false;
+        } else {
+            self.server_write_enabled = false;
+        }
+    }
+
     pub fn mark_eof(&mut self, fd: i32) {
         if self.is_client_fd(fd) {
             self.client_eof = true;
@@ -145,6 +165,14 @@ impl Connection {
             !self.upstream_buffer.is_empty()
         } else {
             !self.downstream_buffer.is_empty()
+        }
+    }
+
+    pub fn is_write_enabled(&self, fd: i32) -> bool {
+        if self.is_client_fd(fd) {
+            self.client_write_enabled
+        } else {
+            self.server_write_enabled
         }
     }
 

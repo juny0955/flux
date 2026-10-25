@@ -14,13 +14,54 @@ use crate::{connection::Connection, kqueue::Kqueue};
 
 const MAX_EVENTS: i32 = 64;
 
-pub struct Proxy {
-    kq: Kqueue,
-    listener: TcpListener,
-
+struct ConnectionStore {
     connections: HashMap<usize, Connection>,
     fd_to_connection: HashMap<RawFd, usize>,
     next_connection_id: usize,
+}
+
+impl ConnectionStore {
+    pub fn new() -> Self {
+        Self {
+            connections: HashMap::new(),
+            fd_to_connection: HashMap::new(),
+            next_connection_id: 0,
+        }
+    }
+
+    pub fn insert(&mut self, connection: Connection) {
+        let client_fd = connection.client_fd();
+        let server_fd = connection.server_fd();
+        self.connections.insert(self.next_connection_id, connection);
+
+        self.fd_to_connection
+            .insert(client_fd, self.next_connection_id);
+        self.fd_to_connection
+            .insert(server_fd, self.next_connection_id);
+
+        self.next_connection_id += 1;
+    }
+
+    /// 대상 소켓과 연결된 connection을 제거한다
+    pub fn remove_connection(&mut self, fd: RawFd) {
+        if let Some(id) = self.fd_to_connection.remove(&fd)
+            && let Some(connection) = self.connections.remove(&id)
+        {
+            self.fd_to_connection.remove(&connection.client_fd());
+            self.fd_to_connection.remove(&connection.server_fd());
+        }
+    }
+
+    pub fn connection_mut(&mut self, fd: RawFd) -> Option<&mut Connection> {
+        let connection_id = self.fd_to_connection.get(&fd)?;
+        self.connections.get_mut(connection_id)
+    }
+}
+
+pub struct Proxy {
+    kq: Kqueue,
+    listener: TcpListener,
+    connections: ConnectionStore,
 }
 
 impl Proxy {
@@ -34,9 +75,7 @@ impl Proxy {
         Ok(Self {
             listener,
             kq,
-            connections: HashMap::new(),
-            fd_to_connection: HashMap::new(),
-            next_connection_id: 0,
+            connections: ConnectionStore::new(),
         })
     }
 
@@ -60,14 +99,14 @@ impl Proxy {
                     return Err(e);
                 }
             };
-            
+
             for event in &events[..count] {
                 if let Err(e) = self.dispatch_event(event) {
                     let fd = event.ident as RawFd;
                     warn!(%e, fd, "event 처리 실패");
 
                     if fd != self.listener.as_raw_fd() {
-                        self.remove_connection(fd);
+                        self.connections.remove_connection(fd);
                     }
                 }
             }
@@ -76,7 +115,7 @@ impl Proxy {
 
     fn dispatch_event(&mut self, event: &kevent) -> io::Result<()> {
         if event.flags & libc::EV_ERROR != 0 {
-            let error = io::Error::from_raw_os_error(event.data as i32);
+            let error = io::Error::from_raw_os_error(event.data as RawFd);
             return Err(error);
         }
 
@@ -111,69 +150,67 @@ impl Proxy {
     }
 
     fn handle_read_event(&mut self, event: &kevent) -> io::Result<()> {
-        let fd = event.ident as i32;
-        let Some(connection) = self.connection_mut(fd) else {
-            warn!(fd = fd, "connection 조회 실패");
+        let fd = event.ident as RawFd;
+        let Some(connection) = self.connections.connection_mut(fd) else {
+            warn!(fd, "connection 조회 실패");
             return Ok(());
         };
 
+        let peer_fd = connection.peer_fd(fd);
         let result = loop {
             match connection.read_from(fd) {
                 Ok(n) => break n,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => {
-                    warn!(fd, %e, "connection 읽기 실패");
-                    self.remove_connection(fd);
+                    warn!(fd, peer_fd, %e, "connection 읽기 실패");
+                    self.connections.remove_connection(fd);
                     return Ok(());
                 }
             }
         };
 
-        let peer_fd = connection.peer_fd(fd);
         // read eof 처리
         if result == 0 {
-            let Some(connection) = self
-                .fd_to_connection
-                .get(&fd)
-                .and_then(|id| self.connections.get_mut(id))
-            else {
-                warn!(fd, "connection 조회 실패");
-                return Ok(());
-            };
-
             connection.mark_eof(fd);
             self.kq.disable_read(fd)?;
 
             if connection.has_pending_data(fd) {
-                self.kq.register_write(peer_fd)?;
+                if !connection.is_write_enabled(peer_fd) {
+                    self.kq.register_write(peer_fd)?;
+                    connection.mark_write_enabled(peer_fd);
+                }
             } else {
                 connection.shutdown_write(peer_fd)?;
             }
 
             if connection.is_finished() {
-                self.remove_connection(fd);
+                self.connections.remove_connection(fd);
             }
 
             return Ok(());
         }
 
-        self.kq.register_write(peer_fd)?;
+        if !connection.is_write_enabled(peer_fd) {
+            self.kq.register_write(peer_fd)?;
+            connection.mark_write_enabled(peer_fd);
+        }
 
         Ok(())
     }
 
     fn handle_write_event(&mut self, event: &kevent) -> io::Result<()> {
-        let fd = event.ident as i32;
-        let connection = match self.connection_mut(fd) {
+        let fd = event.ident as RawFd;
+        let connection = match self.connections.connection_mut(fd) {
             Some(connection) => connection,
             None => {
-                warn!(fd = fd, "connection 조회 실패");
+                warn!(fd, "connection 조회 실패");
                 return Ok(());
             }
         };
 
         if connection.is_connected() {
+            let peer_fd = connection.peer_fd(fd);
             // 전송 시도 후 데이터가 남아있으면 반대변 소켓 write event 등록
             loop {
                 match connection.write_to(fd) {
@@ -181,31 +218,25 @@ impl Proxy {
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        warn!(fd, %e, "connection 쓰기 실패");
-                        self.remove_connection(fd);
+                        warn!(fd, peer_fd, %e, "connection 쓰기 실패");
+                        self.connections.remove_connection(fd);
                         return Ok(());
                     }
                 }
             }
 
-            let peer_fd = connection.peer_fd(fd);
             if !connection.has_pending_data(peer_fd) {
-                let Some(connection) = self
-                    .fd_to_connection
-                    .get(&fd)
-                    .and_then(|id| self.connections.get_mut(id))
-                else {
-                    warn!(fd, "connection 조회 실패");
-                    return Ok(());
-                };
-                self.kq.disable_write(fd)?;
+                if connection.is_write_enabled(fd) {
+                    self.kq.disable_write(fd)?;
+                    connection.mark_write_disabled(fd);
+                }
 
                 if connection.is_eof(peer_fd) {
                     connection.shutdown_write(fd)?;
                 }
 
                 if connection.is_finished() {
-                    self.remove_connection(fd);
+                    self.connections.remove_connection(fd);
                 }
             }
         } else {
@@ -215,12 +246,13 @@ impl Proxy {
 
             if let Err(e) = connection.finish_connect() {
                 warn!(%e, "서버 연결 실패");
-                self.remove_connection(server_fd);
+                self.connections.remove_connection(server_fd);
                 return Ok(());
             }
             info!("client 연결 {}", connection.client_addr()?);
 
             self.kq.disable_write(server_fd)?;
+            connection.mark_write_disabled(server_fd);
             self.kq.register_read(server_fd)?;
             self.kq.register_read(client_fd)?;
         }
@@ -229,7 +261,7 @@ impl Proxy {
     }
 
     fn new_connection(&mut self, client: TcpStream) -> io::Result<()> {
-        let connection = Connection::connect(client)?;
+        let mut connection = Connection::connect(client)?;
 
         if connection.is_connected() {
             // client, server read event 등록
@@ -239,39 +271,11 @@ impl Proxy {
         } else {
             // server write event 등록
             self.kq.register_write(connection.server_fd())?;
+            connection.mark_write_enabled(connection.server_fd());
         }
 
-        self.add_connection(connection);
+        self.connections.insert(connection);
 
         Ok(())
-    }
-
-    /// 대상 소켓과 연결된 connection을 제거한다
-    fn remove_connection(&mut self, fd: RawFd) {
-        if let Some(id) = self.fd_to_connection.remove(&fd)
-            && let Some(connection) = self.connections.remove(&id)
-        {
-            self.fd_to_connection.remove(&connection.client_fd());
-            self.fd_to_connection.remove(&connection.server_fd());
-        }
-    }
-
-    fn add_connection(&mut self, connection: Connection) {
-        let client_fd = connection.client_fd();
-        let server_fd = connection.server_fd();
-
-        self.connections.insert(self.next_connection_id, connection);
-
-        self.fd_to_connection
-            .insert(client_fd, self.next_connection_id);
-        self.fd_to_connection
-            .insert(server_fd, self.next_connection_id);
-
-        self.next_connection_id += 1;
-    }
-
-    fn connection_mut(&mut self, fd: i32) -> Option<&mut Connection> {
-        let connection_id = self.fd_to_connection.get(&fd)?;
-        self.connections.get_mut(connection_id)
     }
 }
