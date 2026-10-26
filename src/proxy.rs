@@ -118,13 +118,11 @@ impl Proxy {
 
     fn dispatch_event(&mut self, event: &kevent) -> io::Result<()> {
         if event.flags & libc::EV_ERROR != 0 {
-            let error = io::Error::from_raw_os_error(event.data as RawFd);
+            let error = io::Error::from_raw_os_error(event.data as i32);
             return Err(error);
         }
 
-        let fd = event.ident as RawFd;
-
-        if fd == self.listener.as_raw_fd() && event.filter == libc::EVFILT_READ {
+        if event.ident as RawFd == self.listener.as_raw_fd() && event.filter == libc::EVFILT_READ {
             return self.handle_accept(event);
         }
 
@@ -180,36 +178,26 @@ impl Proxy {
 
         match result {
             ReadResult::Data => {
-                if !connection.is_write_enabled(peer_fd) {
-                    self.kq.enable_write(peer_fd)?;
-                    connection.mark_write_enabled(peer_fd);
-                }
+                connection.enable_write(&self.kq, peer_fd)?;
 
                 if connection.is_buffer_full(fd) {
-                    self.kq.disable_read(fd)?;
-                    connection.mark_read_disabled(fd);
+                    connection.disable_read(&self.kq, fd)?;
                 }
             }
             ReadResult::BufferFull => {
-                self.kq.disable_read(fd)?;
-                connection.mark_read_disabled(fd);
+                connection.disable_read(&self.kq, fd)?;
 
-                if connection.has_pending_data(fd) && !connection.is_write_enabled(peer_fd) {
-                    self.kq.enable_write(peer_fd)?;
-                    connection.mark_write_enabled(peer_fd);
+                if connection.has_pending_data(fd) {
+                    connection.enable_write(&self.kq, peer_fd)?;
                 }
             }
             ReadResult::Eof => {
                 connection.mark_eof(fd);
 
-                self.kq.disable_read(fd)?;
-                connection.mark_read_disabled(fd);
+                connection.disable_read(&self.kq, fd)?;
 
                 if connection.has_pending_data(fd) {
-                    if !connection.is_write_enabled(peer_fd) {
-                        self.kq.enable_write(peer_fd)?;
-                        connection.mark_write_enabled(peer_fd);
-                    }
+                    connection.enable_write(&self.kq, peer_fd)?;
                 } else {
                     connection.shutdown_write(peer_fd)?;
                 }
@@ -253,17 +241,12 @@ impl Proxy {
                 }
             }
 
-            if !connection.is_read_enabled(peer_fd)
-                && !connection.is_buffer_full(peer_fd)
-                && !connection.is_eof(peer_fd)
-            {
-                self.kq.enable_read(peer_fd)?;
-                connection.mark_read_enabled(peer_fd);
+            if !connection.is_buffer_full(peer_fd) && !connection.is_eof(peer_fd) {
+                connection.enable_read(&self.kq, peer_fd)?;
             }
 
             if !connection.has_pending_data(peer_fd) {
-                self.kq.disable_write(fd)?;
-                connection.mark_write_disabled(fd);
+                connection.disable_write(&self.kq, fd)?;
 
                 if connection.is_eof(peer_fd) {
                     connection.shutdown_write(fd)?;
@@ -285,14 +268,10 @@ impl Proxy {
             }
             // info!("client 연결 {}", connection.client_addr()?);
 
-            self.kq.disable_write(server_fd)?;
-            connection.mark_write_disabled(server_fd);
+            connection.disable_write(&self.kq, server_fd)?;
 
-            self.kq.enable_read(server_fd)?;
-            self.kq.enable_read(client_fd)?;
-
-            connection.mark_read_enabled(server_fd);
-            connection.mark_read_enabled(client_fd);
+            connection.enable_read(&self.kq, server_fd)?;
+            connection.enable_read(&self.kq, client_fd)?;
         }
 
         Ok(())
@@ -303,16 +282,12 @@ impl Proxy {
 
         if connection.is_connected() {
             // client, server read event 등록
-            self.kq.enable_read(connection.client_fd())?;
-            self.kq.enable_read(connection.server_fd())?;
-
-            connection.mark_read_enabled(connection.client_fd());
-            connection.mark_read_enabled(connection.server_fd());
+            connection.enable_read(&self.kq, connection.server_fd())?;
+            connection.enable_read(&self.kq, connection.client_fd())?;
             // info!("client 연결: {}", connection.client_addr()?);
         } else {
             // server write event 등록
-            self.kq.enable_write(connection.server_fd())?;
-            connection.mark_write_enabled(connection.server_fd());
+            connection.enable_write(&self.kq, connection.server_fd())?;
         }
 
         self.connections.insert(connection);

@@ -7,6 +7,8 @@ use std::{
 
 use libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM};
 
+use crate::kqueue::Kqueue;
+
 const BUFFER_SIZE: usize = 16 * 1024; // 16KB
 
 #[derive(Clone, Copy)]
@@ -56,20 +58,79 @@ pub enum ReadResult {
     BufferFull,
 }
 
+struct Endpoint {
+    stream: TcpStream,
+    read_enabled: bool,
+    write_enabled: bool,
+    read_eof: bool,
+}
+
+impl Endpoint {
+    pub fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            read_enabled: false,
+            write_enabled: false,
+            read_eof: false,
+        }
+    }
+
+    pub fn enable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
+        if !self.read_enabled {
+            kq.enable_read(self.raw_fd())?;
+            self.read_enabled = true;
+        }
+
+        Ok(())
+    }
+
+    pub fn enable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
+        if !self.write_enabled {
+            kq.enable_write(self.raw_fd())?;
+            self.write_enabled = true;
+        }
+
+        Ok(())
+    }
+
+    pub fn disable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
+        if self.read_enabled {
+            kq.disable_read(self.raw_fd())?;
+            self.read_enabled = false;
+        }
+
+        Ok(())
+    }
+
+    pub fn disable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
+        if self.write_enabled {
+            kq.disable_write(self.raw_fd())?;
+            self.write_enabled = false;
+        }
+
+        Ok(())
+    }
+
+    pub fn shutdown_write(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Write)
+    }
+
+    pub fn raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.stream.take_error()
+    }
+}
+
 pub struct Connection {
-    client: TcpStream,
-    server: TcpStream,
+    client: Endpoint,
+    server: Endpoint,
     state: ConnectionState,
 
     upstream_buffer: Buffer,
     downstream_buffer: Buffer,
-
-    clinet_read_enabled: bool,
-    server_read_enabled: bool,
-    client_write_enabled: bool,
-    server_write_enabled: bool,
-    client_eof: bool,
-    server_eof: bool,
 }
 
 impl Connection {
@@ -79,17 +140,11 @@ impl Connection {
         let (server, state) = connect_server()?;
 
         Ok(Self {
-            client,
-            server,
+            client: Endpoint::new(client),
+            server: Endpoint::new(server),
             state,
             upstream_buffer: Buffer::new(),
             downstream_buffer: Buffer::new(),
-            clinet_read_enabled: false,
-            server_read_enabled: false,
-            client_write_enabled: false,
-            server_write_enabled: false,
-            client_eof: false,
-            server_eof: false,
         })
     }
 
@@ -104,7 +159,7 @@ impl Connection {
 
     /// fd: 읽을 대상 소켓
     pub fn read_from(&mut self, fd: RawFd) -> io::Result<ReadResult> {
-        let (stream, buffer) = if self.is_client_fd(fd) {
+        let (endpoint, buffer) = if self.is_client_fd(fd) {
             (&mut self.client, &mut self.upstream_buffer)
         } else {
             (&mut self.server, &mut self.downstream_buffer)
@@ -117,7 +172,7 @@ impl Connection {
             return Ok(ReadResult::BufferFull);
         }
 
-        let n = stream.read(&mut buffer.data[buffer.write_pos..])?;
+        let n = endpoint.stream.read(&mut buffer.data[buffer.write_pos..])?;
 
         if n == 0 {
             return Ok(ReadResult::Eof);
@@ -129,7 +184,7 @@ impl Connection {
 
     /// fd: 전송할 대상 소켓
     pub fn write_to(&mut self, fd: RawFd) -> io::Result<()> {
-        let (stream, buffer) = if self.is_client_fd(fd) {
+        let (endpoint, buffer) = if self.is_client_fd(fd) {
             (&mut self.client, &mut self.downstream_buffer)
         } else {
             (&mut self.server, &mut self.upstream_buffer)
@@ -139,7 +194,9 @@ impl Connection {
             return Ok(());
         }
 
-        let n = stream.write(&buffer.data[buffer.read_pos..buffer.write_pos])?;
+        let n = endpoint
+            .stream
+            .write(&buffer.data[buffer.read_pos..buffer.write_pos])?;
         buffer.read_pos += n;
 
         if n == 0 {
@@ -150,52 +207,28 @@ impl Connection {
         Ok(())
     }
 
-    pub fn mark_read_enabled(&mut self, fd: RawFd) {
-        if self.is_client_fd(fd) {
-            self.clinet_read_enabled = true;
-        } else {
-            self.server_read_enabled = true;
-        }
+    pub fn enable_read(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+        self.endpoint_mut(fd).enable_read(kq)
     }
 
-    pub fn mark_read_disabled(&mut self, fd: RawFd) {
-        if self.is_client_fd(fd) {
-            self.clinet_read_enabled = false;
-        } else {
-            self.server_read_enabled = false;
-        }
+    pub fn disable_read(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+        self.endpoint_mut(fd).disable_read(kq)
     }
 
-    pub fn mark_write_enabled(&mut self, fd: RawFd) {
-        if self.is_client_fd(fd) {
-            self.client_write_enabled = true;
-        } else {
-            self.server_write_enabled = true;
-        }
+    pub fn enable_write(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+        self.endpoint_mut(fd).enable_write(kq)
     }
 
-    pub fn mark_write_disabled(&mut self, fd: RawFd) {
-        if self.is_client_fd(fd) {
-            self.client_write_enabled = false;
-        } else {
-            self.server_write_enabled = false;
-        }
-    }
-
-    pub fn mark_eof(&mut self, fd: RawFd) {
-        if self.is_client_fd(fd) {
-            self.client_eof = true;
-        } else {
-            self.server_eof = true;
-        }
+    pub fn disable_write(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+        self.endpoint_mut(fd).disable_write(kq)
     }
 
     pub fn shutdown_write(&mut self, fd: RawFd) -> io::Result<()> {
-        if self.is_client_fd(fd) {
-            self.client.shutdown(Shutdown::Write)
-        } else {
-            self.server.shutdown(Shutdown::Write)
-        }
+        self.endpoint_mut(fd).shutdown_write()
+    }
+
+    pub fn mark_eof(&mut self, fd: RawFd) {
+        self.endpoint_mut(fd).read_eof = true;
     }
 
     pub fn peer_fd(&self, fd: RawFd) -> RawFd {
@@ -222,51 +255,47 @@ impl Connection {
         }
     }
 
-    pub fn is_read_enabled(&self, fd: RawFd) -> bool {
-        if self.is_client_fd(fd) {
-            self.clinet_read_enabled
-        } else {
-            self.server_read_enabled
-        }
-    }
-
-    pub fn is_write_enabled(&self, fd: RawFd) -> bool {
-        if self.is_client_fd(fd) {
-            self.client_write_enabled
-        } else {
-            self.server_write_enabled
-        }
-    }
-
     pub fn is_eof(&self, fd: RawFd) -> bool {
-        if self.is_client_fd(fd) {
-            self.client_eof
-        } else {
-            self.server_eof
-        }
+        self.endpoint(fd).read_eof
     }
 
     pub fn is_finished(&self) -> bool {
-        self.client_eof
-            && self.server_eof
+        self.client.read_eof
+            && self.server.read_eof
             && self.upstream_buffer.is_empty()
             && self.downstream_buffer.is_empty()
     }
 
-    pub fn is_client_fd(&self, fd: i32) -> bool {
-        self.client_fd() == fd
-    }
-
     pub fn client_fd(&self) -> RawFd {
-        self.client.as_raw_fd()
+        self.client.raw_fd()
     }
 
     pub fn server_fd(&self) -> RawFd {
-        self.server.as_raw_fd()
+        self.server.raw_fd()
     }
 
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ConnectionState::Connected)
+    }
+
+    fn endpoint(&self, fd: RawFd) -> &Endpoint {
+        if self.is_client_fd(fd) {
+            &self.client
+        } else {
+            &self.server
+        }
+    }
+
+    fn endpoint_mut(&mut self, fd: RawFd) -> &mut Endpoint {
+        if self.is_client_fd(fd) {
+            &mut self.client
+        } else {
+            &mut self.server
+        }
+    }
+
+    fn is_client_fd(&self, fd: RawFd) -> bool {
+        self.client_fd() == fd
     }
 }
 
