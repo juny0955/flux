@@ -54,53 +54,33 @@ impl Kqueue {
     }
 
     /// 해당 소켓 FD에 EVFILT_READ 이벤트를 kqueue에 등록한다
-    pub fn register_read(&self, socket_fd: RawFd) -> io::Result<()> {
-        self.register_event(socket_fd, EVFILT_READ)
+    pub fn enable_read(&self, socket_fd: RawFd) -> io::Result<()> {
+        self.change_event(socket_fd, EV_ADD | EV_ENABLE, EVFILT_READ)
     }
 
-    pub fn register_write(&self, socket_fd: RawFd) -> io::Result<()> {
-        self.register_event(socket_fd, EVFILT_WRITE)
+    pub fn enable_write(&self, socket_fd: RawFd) -> io::Result<()> {
+        self.change_event(socket_fd, EV_ADD | EV_ENABLE, EVFILT_WRITE)
     }
 
     pub fn disable_read(&self, socket_fd: RawFd) -> io::Result<()> {
-        self.disable_event(socket_fd, EVFILT_READ)
+        self.change_event(socket_fd, EV_DISABLE, EVFILT_READ)
     }
 
     pub fn disable_write(&self, socket_fd: RawFd) -> io::Result<()> {
-        self.disable_event(socket_fd, EVFILT_WRITE)
+        self.change_event(socket_fd, EV_DISABLE, EVFILT_WRITE)
     }
 
     pub fn raw_fd(&self) -> RawFd {
         self.kq.as_raw_fd()
     }
 
-    fn register_event(&self, socket_fd: RawFd, filter: i16) -> io::Result<()> {
+    fn change_event(&self, socket_fd: RawFd, flags: u16, filter: i16) -> io::Result<()> {
         let change = libc::kevent {
             ident: socket_fd as uintptr_t,
-            flags: EV_ADD | EV_ENABLE,
             fflags: 0,
             data: 0,
             udata: ptr::null_mut(),
-            filter,
-        };
-
-        let result =
-            unsafe { libc::kevent(self.raw_fd(), &change, 1, ptr::null_mut(), 0, ptr::null()) };
-
-        if result == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
-
-    fn disable_event(&self, socket_fd: RawFd, filter: i16) -> io::Result<()> {
-        let change = libc::kevent {
-            ident: socket_fd as uintptr_t,
-            flags: EV_DISABLE,
-            fflags: 0,
-            data: 0,
-            udata: ptr::null_mut(),
+            flags,
             filter,
         };
 

@@ -1,11 +1,13 @@
 use std::{
     io::{self, Read, Write},
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::{Shutdown, TcpStream},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr,
 };
 
 use libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM};
+
+const BUFFER_SIZE: usize = 16 * 1024; // 16KB
 
 #[derive(Clone, Copy)]
 enum ConnectionState {
@@ -14,38 +16,44 @@ enum ConnectionState {
 }
 
 struct Buffer {
-    data: Vec<u8>,
-    offset: usize,
+    data: [u8; BUFFER_SIZE],
+    read_pos: usize,
+    write_pos: usize,
 }
 
 impl Buffer {
     pub fn new() -> Self {
         Self {
-            data: Vec::new(),
-            offset: 0,
+            data: [0u8; BUFFER_SIZE],
+            read_pos: 0,
+            write_pos: 0,
         }
     }
 
-    pub fn read(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
-    }
-
-    pub fn extra_buf(&self) -> &[u8] {
-        &self.data[self.offset..]
-    }
-
-    pub fn write(&mut self, len: usize) {
-        self.offset += len;
-
-        if self.is_empty() {
-            self.data.clear();
-            self.offset = 0;
+    fn compact(&mut self) {
+        if self.read_pos == 0 {
+            return;
         }
+
+        self.data.copy_within(self.read_pos..self.write_pos, 0);
+
+        self.write_pos -= self.read_pos;
+        self.read_pos = 0;
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.write_pos - self.read_pos == BUFFER_SIZE
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.len() == self.offset
+        self.read_pos == self.write_pos
     }
+}
+
+pub enum ReadResult {
+    Data,
+    Eof,
+    BufferFull,
 }
 
 pub struct Connection {
@@ -56,6 +64,8 @@ pub struct Connection {
     upstream_buffer: Buffer,
     downstream_buffer: Buffer,
 
+    clinet_read_enabled: bool,
+    server_read_enabled: bool,
     client_write_enabled: bool,
     server_write_enabled: bool,
     client_eof: bool,
@@ -74,6 +84,8 @@ impl Connection {
             state,
             upstream_buffer: Buffer::new(),
             downstream_buffer: Buffer::new(),
+            clinet_read_enabled: false,
+            server_read_enabled: false,
             client_write_enabled: false,
             server_write_enabled: false,
             client_eof: false,
@@ -91,36 +103,70 @@ impl Connection {
     }
 
     /// fd: 읽을 대상 소켓
-    pub fn read_from(&mut self, fd: i32) -> io::Result<usize> {
-        let mut buf = [0_u8; 8192];
-
-        let result = if self.is_client_fd(fd) {
-            let n = self.client.read(&mut buf)?;
-            self.upstream_buffer.read(&buf[..n]);
-            n
+    pub fn read_from(&mut self, fd: RawFd) -> io::Result<ReadResult> {
+        let (stream, buffer) = if self.is_client_fd(fd) {
+            (&mut self.client, &mut self.upstream_buffer)
         } else {
-            let n = self.server.read(&mut buf)?;
-            self.downstream_buffer.read(&buf[..n]);
-            n
+            (&mut self.server, &mut self.downstream_buffer)
         };
 
-        Ok(result)
+        if buffer.write_pos == BUFFER_SIZE {
+            buffer.compact();
+        }
+        if buffer.write_pos == BUFFER_SIZE {
+            return Ok(ReadResult::BufferFull);
+        }
+
+        let n = stream.read(&mut buffer.data[buffer.write_pos..])?;
+
+        if n == 0 {
+            return Ok(ReadResult::Eof);
+        }
+
+        buffer.write_pos += n;
+        Ok(ReadResult::Data)
     }
 
     /// fd: 전송할 대상 소켓
-    pub fn write_to(&mut self, fd: i32) -> io::Result<()> {
-        if self.is_client_fd(fd) {
-            let n = self.client.write(self.downstream_buffer.extra_buf())?;
-            self.downstream_buffer.write(n);
+    pub fn write_to(&mut self, fd: RawFd) -> io::Result<()> {
+        let (stream, buffer) = if self.is_client_fd(fd) {
+            (&mut self.client, &mut self.downstream_buffer)
         } else {
-            let n = self.server.write(self.upstream_buffer.extra_buf())?;
-            self.upstream_buffer.write(n);
+            (&mut self.server, &mut self.upstream_buffer)
+        };
+
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        let n = stream.write(&buffer.data[buffer.read_pos..buffer.write_pos])?;
+        buffer.read_pos += n;
+
+        if n == 0 {
+            buffer.read_pos = 0;
+            buffer.write_pos = 0;
         }
 
         Ok(())
     }
 
-    pub fn mark_write_enabled(&mut self, fd: i32) {
+    pub fn mark_read_enabled(&mut self, fd: RawFd) {
+        if self.is_client_fd(fd) {
+            self.clinet_read_enabled = true;
+        } else {
+            self.server_read_enabled = true;
+        }
+    }
+
+    pub fn mark_read_disabled(&mut self, fd: RawFd) {
+        if self.is_client_fd(fd) {
+            self.clinet_read_enabled = false;
+        } else {
+            self.server_read_enabled = false;
+        }
+    }
+
+    pub fn mark_write_enabled(&mut self, fd: RawFd) {
         if self.is_client_fd(fd) {
             self.client_write_enabled = true;
         } else {
@@ -128,7 +174,7 @@ impl Connection {
         }
     }
 
-    pub fn mark_write_disabled(&mut self, fd: i32) {
+    pub fn mark_write_disabled(&mut self, fd: RawFd) {
         if self.is_client_fd(fd) {
             self.client_write_enabled = false;
         } else {
@@ -136,7 +182,7 @@ impl Connection {
         }
     }
 
-    pub fn mark_eof(&mut self, fd: i32) {
+    pub fn mark_eof(&mut self, fd: RawFd) {
         if self.is_client_fd(fd) {
             self.client_eof = true;
         } else {
@@ -144,7 +190,7 @@ impl Connection {
         }
     }
 
-    pub fn shutdown_write(&mut self, fd: i32) -> io::Result<()> {
+    pub fn shutdown_write(&mut self, fd: RawFd) -> io::Result<()> {
         if self.is_client_fd(fd) {
             self.client.shutdown(Shutdown::Write)
         } else {
@@ -152,7 +198,7 @@ impl Connection {
         }
     }
 
-    pub fn peer_fd(&self, fd: i32) -> RawFd {
+    pub fn peer_fd(&self, fd: RawFd) -> RawFd {
         if self.is_client_fd(fd) {
             self.server_fd()
         } else {
@@ -160,7 +206,7 @@ impl Connection {
         }
     }
 
-    pub fn has_pending_data(&self, fd: i32) -> bool {
+    pub fn has_pending_data(&self, fd: RawFd) -> bool {
         if self.is_client_fd(fd) {
             !self.upstream_buffer.is_empty()
         } else {
@@ -168,7 +214,23 @@ impl Connection {
         }
     }
 
-    pub fn is_write_enabled(&self, fd: i32) -> bool {
+    pub fn is_buffer_full(&self, fd: RawFd) -> bool {
+        if self.is_client_fd(fd) {
+            self.upstream_buffer.is_full()
+        } else {
+            self.downstream_buffer.is_full()
+        }
+    }
+
+    pub fn is_read_enabled(&self, fd: RawFd) -> bool {
+        if self.is_client_fd(fd) {
+            self.clinet_read_enabled
+        } else {
+            self.server_read_enabled
+        }
+    }
+
+    pub fn is_write_enabled(&self, fd: RawFd) -> bool {
         if self.is_client_fd(fd) {
             self.client_write_enabled
         } else {
@@ -176,7 +238,7 @@ impl Connection {
         }
     }
 
-    pub fn is_eof(&self, fd: i32) -> bool {
+    pub fn is_eof(&self, fd: RawFd) -> bool {
         if self.is_client_fd(fd) {
             self.client_eof
         } else {
@@ -206,14 +268,11 @@ impl Connection {
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ConnectionState::Connected)
     }
-
-    pub fn client_addr(&self) -> io::Result<SocketAddr> {
-        self.client.peer_addr()
-    }
 }
 
 fn connect_server() -> io::Result<(TcpStream, ConnectionState)> {
     unsafe {
+        // server 소켓 생성
         let server_fd = libc::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if server_fd == -1 {
             return Err(io::Error::last_os_error());

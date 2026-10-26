@@ -8,9 +8,12 @@ use std::{
 };
 
 use libc::kevent;
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::{connection::Connection, kqueue::Kqueue};
+use crate::{
+    connection::{Connection, ReadResult},
+    kqueue::Kqueue,
+};
 
 const MAX_EVENTS: i32 = 64;
 
@@ -70,7 +73,7 @@ impl Proxy {
         listener.set_nonblocking(true)?;
 
         let kq = Kqueue::new()?;
-        kq.register_read(listener.as_raw_fd())?;
+        kq.enable_read(listener.as_raw_fd())?;
 
         Ok(Self {
             listener,
@@ -122,7 +125,7 @@ impl Proxy {
         let fd = event.ident as RawFd;
 
         if fd == self.listener.as_raw_fd() && event.filter == libc::EVFILT_READ {
-            return self.handle_accept();
+            return self.handle_accept(event);
         }
 
         match event.filter {
@@ -132,10 +135,15 @@ impl Proxy {
         }
     }
 
-    fn handle_accept(&mut self) -> io::Result<()> {
-        loop {
+    fn handle_accept(&mut self, event: &kevent) -> io::Result<()> {
+        let avaliable = event.data.max(0) as usize;
+        let mut accepted = 0;
+
+        while accepted < avaliable {
             match self.listener.accept() {
                 Ok((client, addr)) => {
+                    accepted += 1;
+
                     if let Err(e) = self.new_connection(client) {
                         warn!(%e, %addr, "신규 연결 생성 실패");
                     }
@@ -170,30 +178,48 @@ impl Proxy {
             }
         };
 
-        // read eof 처리
-        if result == 0 {
-            connection.mark_eof(fd);
-            self.kq.disable_read(fd)?;
-
-            if connection.has_pending_data(fd) {
+        match result {
+            ReadResult::Data => {
                 if !connection.is_write_enabled(peer_fd) {
-                    self.kq.register_write(peer_fd)?;
+                    self.kq.enable_write(peer_fd)?;
                     connection.mark_write_enabled(peer_fd);
                 }
-            } else {
-                connection.shutdown_write(peer_fd)?;
+
+                if connection.is_buffer_full(fd) {
+                    self.kq.disable_read(fd)?;
+                    connection.mark_read_disabled(fd);
+                }
             }
+            ReadResult::BufferFull => {
+                self.kq.disable_read(fd)?;
+                connection.mark_read_disabled(fd);
 
-            if connection.is_finished() {
-                self.connections.remove_connection(fd);
+                if connection.has_pending_data(fd) && !connection.is_write_enabled(peer_fd) {
+                    self.kq.enable_write(peer_fd)?;
+                    connection.mark_write_enabled(peer_fd);
+                }
             }
+            ReadResult::Eof => {
+                connection.mark_eof(fd);
 
-            return Ok(());
-        }
+                self.kq.disable_read(fd)?;
+                connection.mark_read_disabled(fd);
 
-        if !connection.is_write_enabled(peer_fd) {
-            self.kq.register_write(peer_fd)?;
-            connection.mark_write_enabled(peer_fd);
+                if connection.has_pending_data(fd) {
+                    if !connection.is_write_enabled(peer_fd) {
+                        self.kq.enable_write(peer_fd)?;
+                        connection.mark_write_enabled(peer_fd);
+                    }
+                } else {
+                    connection.shutdown_write(peer_fd)?;
+                }
+
+                if connection.is_finished() {
+                    self.connections.remove_connection(fd);
+                }
+
+                return Ok(());
+            }
         }
 
         Ok(())
@@ -212,24 +238,32 @@ impl Proxy {
         if connection.is_connected() {
             let peer_fd = connection.peer_fd(fd);
             // 전송 시도 후 데이터가 남아있으면 반대변 소켓 write event 등록
-            loop {
-                match connection.write_to(fd) {
-                    Ok(()) => break,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        warn!(fd, peer_fd, %e, "connection 쓰기 실패");
-                        self.connections.remove_connection(fd);
-                        return Ok(());
+            if connection.has_pending_data(peer_fd) {
+                loop {
+                    match connection.write_to(fd) {
+                        Ok(()) => break,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            warn!(fd, peer_fd, %e, "connection 쓰기 실패");
+                            self.connections.remove_connection(fd);
+                            return Ok(());
+                        }
                     }
                 }
             }
 
+            if !connection.is_read_enabled(peer_fd)
+                && !connection.is_buffer_full(peer_fd)
+                && !connection.is_eof(peer_fd)
+            {
+                self.kq.enable_read(peer_fd)?;
+                connection.mark_read_enabled(peer_fd);
+            }
+
             if !connection.has_pending_data(peer_fd) {
-                if connection.is_write_enabled(fd) {
-                    self.kq.disable_write(fd)?;
-                    connection.mark_write_disabled(fd);
-                }
+                self.kq.disable_write(fd)?;
+                connection.mark_write_disabled(fd);
 
                 if connection.is_eof(peer_fd) {
                     connection.shutdown_write(fd)?;
@@ -249,12 +283,16 @@ impl Proxy {
                 self.connections.remove_connection(server_fd);
                 return Ok(());
             }
-            info!("client 연결 {}", connection.client_addr()?);
+            // info!("client 연결 {}", connection.client_addr()?);
 
             self.kq.disable_write(server_fd)?;
             connection.mark_write_disabled(server_fd);
-            self.kq.register_read(server_fd)?;
-            self.kq.register_read(client_fd)?;
+
+            self.kq.enable_read(server_fd)?;
+            self.kq.enable_read(client_fd)?;
+
+            connection.mark_read_enabled(server_fd);
+            connection.mark_read_enabled(client_fd);
         }
 
         Ok(())
@@ -265,12 +303,15 @@ impl Proxy {
 
         if connection.is_connected() {
             // client, server read event 등록
-            self.kq.register_read(connection.client_fd())?;
-            self.kq.register_read(connection.server_fd())?;
-            info!("client 연결: {}", connection.client_addr()?);
+            self.kq.enable_read(connection.client_fd())?;
+            self.kq.enable_read(connection.server_fd())?;
+
+            connection.mark_read_enabled(connection.client_fd());
+            connection.mark_read_enabled(connection.server_fd());
+            // info!("client 연결: {}", connection.client_addr()?);
         } else {
             // server write event 등록
-            self.kq.register_write(connection.server_fd())?;
+            self.kq.enable_write(connection.server_fd())?;
             connection.mark_write_enabled(connection.server_fd());
         }
 
