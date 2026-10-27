@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     net::{Shutdown, TcpStream},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr,
@@ -148,13 +148,21 @@ impl Connection {
         })
     }
 
-    pub fn finish_connect(&mut self) -> io::Result<()> {
-        if let Some(error) = self.server.take_error()? {
-            return Err(error);
-        }
+    /// 해당 fd 버퍼가 다 차거나 WouldBlock 될 때 까지 read 시도
+    pub fn read(&mut self, fd: RawFd) -> io::Result<ReadResult> {
+        loop {
+            if self.is_buffer_full(fd) {
+                return Ok(ReadResult::BufferFull);
+            }
 
-        self.state = ConnectionState::Connected;
-        Ok(())
+            match self.read_from(fd) {
+                Ok(ReadResult::Data) => continue,
+                Ok(result) => return Ok(result),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(ReadResult::Data),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// fd: 읽을 대상 소켓
@@ -173,7 +181,6 @@ impl Connection {
         }
 
         let n = endpoint.stream.read(&mut buffer.data[buffer.write_pos..])?;
-
         if n == 0 {
             return Ok(ReadResult::Eof);
         }
@@ -182,8 +189,24 @@ impl Connection {
         Ok(ReadResult::Data)
     }
 
+    /// 해당 fd 버퍼를 전부 비우거나 WouldBlock 될 때까지 write 시도
+    pub fn flush(&mut self, fd: RawFd) -> io::Result<()> {
+        loop {
+            match self.write_to(fd) {
+                Ok(()) => {
+                    if !self.has_pending_data(self.peer_fd(fd)) {
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// fd: 전송할 대상 소켓
-    pub fn write_to(&mut self, fd: RawFd) -> io::Result<()> {
+    fn write_to(&mut self, fd: RawFd) -> io::Result<()> {
         let (endpoint, buffer) = if self.is_client_fd(fd) {
             (&mut self.client, &mut self.downstream_buffer)
         } else {
@@ -199,11 +222,21 @@ impl Connection {
             .write(&buffer.data[buffer.read_pos..buffer.write_pos])?;
         buffer.read_pos += n;
 
+        // TODO: 버퍼 초기화 하지말고 WriteZero 처리해야함
         if n == 0 {
             buffer.read_pos = 0;
             buffer.write_pos = 0;
         }
 
+        Ok(())
+    }
+
+    pub fn finish_connect(&mut self) -> io::Result<()> {
+        if let Some(error) = self.server.take_error()? {
+            return Err(error);
+        }
+
+        self.state = ConnectionState::Connected;
         Ok(())
     }
 
@@ -227,8 +260,12 @@ impl Connection {
         self.endpoint_mut(fd).shutdown_write()
     }
 
-    pub fn mark_eof(&mut self, fd: RawFd) {
-        self.endpoint_mut(fd).read_eof = true;
+    /// READ Event 비활성화 후 eof 마킹
+    pub fn mark_eof(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+        let endpoint = self.endpoint_mut(fd);
+        endpoint.disable_read(kq)?;
+        endpoint.read_eof = true;
+        Ok(())
     }
 
     pub fn peer_fd(&self, fd: RawFd) -> RawFd {
