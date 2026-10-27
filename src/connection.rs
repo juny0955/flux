@@ -1,5 +1,5 @@
 use std::{
-    io::{self, ErrorKind, Read, Write},
+    io::{self, Error, ErrorKind, Read, Write},
     net::{Shutdown, TcpStream},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr,
@@ -220,10 +220,14 @@ impl Connection {
         let n = endpoint
             .stream
             .write(&buffer.data[buffer.read_pos..buffer.write_pos])?;
-        buffer.read_pos += n;
 
-        // TODO: 버퍼 초기화 하지말고 WriteZero 처리해야함
         if n == 0 {
+            return Err(Error::new(ErrorKind::WriteZero, "write zero"));
+        }
+
+        buffer.read_pos += n;
+        
+        if buffer.is_empty() {
             buffer.read_pos = 0;
             buffer.write_pos = 0;
         }
