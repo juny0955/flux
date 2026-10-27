@@ -166,7 +166,7 @@ impl Proxy {
         };
 
         let peer_fd = connection.peer_fd(fd);
-        let result = match connection.read(fd) {
+        let result = match connection.read(fd, event.data as usize) {
             Ok(result) => result,
             Err(e) => {
                 warn!(fd, peer_fd, %e, "connection 읽기 실패");
@@ -176,7 +176,7 @@ impl Proxy {
         };
 
         match result {
-            ReadResult::Data => {
+            ReadResult::Data(_) => {
                 if let Err(e) = connection.flush(peer_fd) {
                     warn!(fd = peer_fd, peer_fd = fd, %e, "connection 쓰기 실패");
                     self.connections.remove_connection(fd);

@@ -55,7 +55,7 @@ impl Buffer {
 }
 
 pub enum ReadResult {
-    Data,
+    Data(usize),
     Eof,
     BufferFull,
 }
@@ -154,17 +154,30 @@ impl Connection {
         })
     }
 
-    /// 해당 fd 버퍼가 다 차거나 WouldBlock 될 때 까지 read 시도
-    pub fn read(&mut self, fd: RawFd) -> io::Result<ReadResult> {
+    /// 조건에 도달할때까지 read를 시도한다
+    /// 1. buffer가 가득 한 경우
+    /// 2. event.data의 바이트 수만큼 읽은 경우
+    /// 3. WouldBlock인 경우
+    pub fn read(&mut self, fd: RawFd, byte_len: usize) -> io::Result<ReadResult> {
+        let mut read_bytes = 0;
         loop {
             if self.is_buffer_full(fd) {
                 return Ok(ReadResult::BufferFull);
             }
 
             match self.read_from(fd) {
-                Ok(ReadResult::Data) => continue,
+                Ok(ReadResult::Data(n)) => {
+                    read_bytes += n;
+                    if read_bytes >= byte_len {
+                        return Ok(ReadResult::Data(read_bytes));
+                    }
+
+                    continue;
+                }
                 Ok(result) => return Ok(result),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(ReadResult::Data),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    return Ok(ReadResult::Data(read_bytes));
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
@@ -192,7 +205,7 @@ impl Connection {
         }
 
         buffer.write_pos += n;
-        Ok(ReadResult::Data)
+        Ok(ReadResult::Data(n))
     }
 
     /// 해당 fd 버퍼를 전부 비우거나 WouldBlock 될 때까지 write 시도
