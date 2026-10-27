@@ -16,7 +16,7 @@ use crate::{
     kqueue::Kqueue,
 };
 
-const MAX_EVENTS: i32 = 64;
+const MAX_EVENTS: i32 = 512;
 
 struct ConnectionStore {
     connections: HashMap<usize, Connection>,
