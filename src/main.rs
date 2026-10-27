@@ -1,12 +1,21 @@
 use std::error::Error;
 
 use clap::Parser;
-use flux::{config::Config, proxy::Proxy};
+use flux::{
+    config::{Cli, Config},
+    proxy::Proxy,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let config = Config::parse();
+    let cli = Cli::parse();
+    let config = match Config::load(cli) {
+        Ok(config) => config,
+        Err(error) => {
+            clap::Error::raw(clap::error::ErrorKind::ValueValidation, error.to_string()).exit()
+        }
+    };
     setup();
 
     let listen = config.listen;
