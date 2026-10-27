@@ -1,13 +1,19 @@
 use std::{
     io::{self, Error, ErrorKind, Read, Write},
-    net::{Shutdown, SocketAddrV4, TcpStream},
-    os::fd::{AsRawFd, FromRawFd, RawFd},
+    net::{SocketAddrV4, TcpStream},
+    os::fd::{FromRawFd, RawFd},
     ptr,
 };
 
 use libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM};
 
-use crate::kqueue::Kqueue;
+use crate::{
+    connection::{buffer::Buffer, endpoint::Endpoint},
+    kqueue::Kqueue,
+};
+
+mod buffer;
+mod endpoint;
 
 #[derive(Clone, Copy)]
 enum ConnectionState {
@@ -15,115 +21,10 @@ enum ConnectionState {
     Connected,
 }
 
-struct Buffer {
-    data: Vec<u8>,
-    read_pos: usize,
-    write_pos: usize,
-}
-
-impl Buffer {
-    pub fn new(buffer_size: usize) -> Self {
-        Self {
-            data: vec![0; buffer_size],
-            read_pos: 0,
-            write_pos: 0,
-        }
-    }
-
-    fn compact(&mut self) {
-        if self.read_pos == 0 {
-            return;
-        }
-
-        self.data.copy_within(self.read_pos..self.write_pos, 0);
-
-        self.write_pos -= self.read_pos;
-        self.read_pos = 0;
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.write_pos - self.read_pos == self.buffer_size()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.read_pos == self.write_pos
-    }
-
-    pub fn buffer_size(&self) -> usize {
-        self.data.len()
-    }
-}
-
 pub enum ReadResult {
     Data(usize),
     Eof,
     BufferFull,
-}
-
-struct Endpoint {
-    stream: TcpStream,
-    read_enabled: bool,
-    write_enabled: bool,
-    read_eof: bool,
-}
-
-impl Endpoint {
-    pub fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            read_enabled: false,
-            write_enabled: false,
-            read_eof: false,
-        }
-    }
-
-    pub fn enable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
-        if !self.read_enabled {
-            kq.enable_read(self.raw_fd())?;
-            self.read_enabled = true;
-        }
-
-        Ok(())
-    }
-
-    pub fn enable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
-        if !self.write_enabled {
-            kq.enable_write(self.raw_fd())?;
-            self.write_enabled = true;
-        }
-
-        Ok(())
-    }
-
-    pub fn disable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
-        if self.read_enabled {
-            kq.disable_read(self.raw_fd())?;
-            self.read_enabled = false;
-        }
-
-        Ok(())
-    }
-
-    pub fn disable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
-        if self.write_enabled {
-            kq.disable_write(self.raw_fd())?;
-            self.write_enabled = false;
-        }
-
-        Ok(())
-    }
-
-    pub fn shutdown_write(&self) -> io::Result<()> {
-        self.stream.shutdown(Shutdown::Write)
-    }
-
-    pub fn raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        self.stream.take_error()
-    }
 }
 
 pub struct Connection {
