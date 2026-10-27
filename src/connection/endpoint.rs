@@ -23,40 +23,32 @@ impl Endpoint {
         }
     }
 
-    pub fn enable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
+    pub fn enable_read(&mut self, kq: &mut Kqueue) {
         if !self.read_enabled {
-            kq.enable_read(self.raw_fd())?;
+            kq.enable_read(self.raw_fd());
             self.read_enabled = true;
         }
-
-        Ok(())
     }
 
-    pub fn enable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
+    pub fn enable_write(&mut self, kq: &mut Kqueue) {
         if !self.write_enabled {
-            kq.enable_write(self.raw_fd())?;
+            kq.enable_write(self.raw_fd());
             self.write_enabled = true;
         }
-
-        Ok(())
     }
 
-    pub fn disable_read(&mut self, kq: &Kqueue) -> io::Result<()> {
+    pub fn disable_read(&mut self, kq: &mut Kqueue) {
         if self.read_enabled {
-            kq.disable_read(self.raw_fd())?;
+            kq.disable_read(self.raw_fd());
             self.read_enabled = false;
         }
-
-        Ok(())
     }
 
-    pub fn disable_write(&mut self, kq: &Kqueue) -> io::Result<()> {
+    pub fn disable_write(&mut self, kq: &mut Kqueue) {
         if self.write_enabled {
-            kq.disable_write(self.raw_fd())?;
+            kq.disable_write(self.raw_fd());
             self.write_enabled = false;
         }
-
-        Ok(())
     }
 
     pub fn shutdown_write(&self) -> io::Result<()> {

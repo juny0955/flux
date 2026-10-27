@@ -164,19 +164,19 @@ impl Connection {
         Ok(())
     }
 
-    pub fn enable_read(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+    pub fn enable_read(&mut self, kq: &mut Kqueue, fd: RawFd) {
         self.endpoint_mut(fd).enable_read(kq)
     }
 
-    pub fn disable_read(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+    pub fn disable_read(&mut self, kq: &mut Kqueue, fd: RawFd) {
         self.endpoint_mut(fd).disable_read(kq)
     }
 
-    pub fn enable_write(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+    pub fn enable_write(&mut self, kq: &mut Kqueue, fd: RawFd) {
         self.endpoint_mut(fd).enable_write(kq)
     }
 
-    pub fn disable_write(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+    pub fn disable_write(&mut self, kq: &mut Kqueue, fd: RawFd) {
         self.endpoint_mut(fd).disable_write(kq)
     }
 
@@ -185,11 +185,10 @@ impl Connection {
     }
 
     /// READ Event 비활성화 후 eof 마킹
-    pub fn mark_eof(&mut self, kq: &Kqueue, fd: RawFd) -> io::Result<()> {
+    pub fn mark_eof(&mut self, kq: &mut Kqueue, fd: RawFd) {
         let endpoint = self.endpoint_mut(fd);
-        endpoint.disable_read(kq)?;
+        endpoint.disable_read(kq);
         endpoint.read_eof = true;
-        Ok(())
     }
 
     pub fn peer_fd(&self, fd: RawFd) -> RawFd {

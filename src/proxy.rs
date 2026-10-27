@@ -47,12 +47,15 @@ impl ConnectionStore {
     }
 
     /// 대상 소켓과 연결된 connection을 제거한다
-    pub fn remove_connection(&mut self, fd: RawFd) {
+    pub fn remove_connection(&mut self, fd: RawFd, kq: &mut Kqueue) {
         if let Some(id) = self.fd_to_connection.remove(&fd)
             && let Some(connection) = self.connections.remove(&id)
         {
             self.fd_to_connection.remove(&connection.client_fd());
             self.fd_to_connection.remove(&connection.server_fd());
+
+            kq.cancel_changes(connection.client_fd());
+            kq.cancel_changes(connection.server_fd());
         }
     }
 
@@ -74,8 +77,8 @@ impl Proxy {
         let listener = TcpListener::bind(config.listen)?;
         listener.set_nonblocking(true)?;
 
-        let kq = Kqueue::new()?;
-        kq.enable_read(listener.as_raw_fd())?;
+        let mut kq = Kqueue::new()?;
+        kq.enable_read(listener.as_raw_fd());
 
         Ok(Self {
             config,
@@ -97,6 +100,13 @@ impl Proxy {
         }; MAX_EVENTS as usize];
 
         loop {
+            /* 
+                kqueue::wait() 시점에 pending_changes가 실제 커널에 등록된다
+                Endpoint에서 pending_changes에 event를 push 하며 상태값을 변경하지만 실제 등록되지는 얺는다
+                
+                현재는 kqueue::wait() 오류시 loop가 종료되서 무관 하지만 혹시라도
+                loop가 지속되어야 한다면 해당 정합성 문제를 해결해야한다
+             */
             let count = match self.kq.wait(&mut events) {
                 Ok(count) => count,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -112,7 +122,7 @@ impl Proxy {
                     warn!(%e, fd, "event 처리 실패");
 
                     if fd != self.listener.as_raw_fd() {
-                        self.connections.remove_connection(fd);
+                        self.connections.remove_connection(fd, &mut self.kq);
                     }
                 }
             }
@@ -170,7 +180,7 @@ impl Proxy {
             Ok(result) => result,
             Err(e) => {
                 warn!(fd, peer_fd, %e, "connection 읽기 실패");
-                self.connections.remove_connection(fd);
+                self.connections.remove_connection(fd, &mut self.kq);
                 return Ok(());
             }
         };
@@ -179,16 +189,16 @@ impl Proxy {
             ReadResult::Data(_) => {
                 if let Err(e) = connection.flush(peer_fd) {
                     warn!(fd = peer_fd, peer_fd = fd, %e, "connection 쓰기 실패");
-                    self.connections.remove_connection(fd);
+                    self.connections.remove_connection(fd, &mut self.kq);
                     return Ok(());
                 }
 
-                update_write_interest(connection, &self.kq, fd)?;
+                update_write_interest(connection, &mut self.kq, fd);
 
                 if connection.is_buffer_full(fd) {
-                    connection.disable_read(&self.kq, fd)?;
+                    connection.disable_read(&mut self.kq, fd);
                 } else {
-                    connection.enable_read(&self.kq, fd)?;
+                    connection.enable_read(&mut self.kq, fd);
                 }
             }
             ReadResult::BufferFull => {
@@ -196,35 +206,35 @@ impl Proxy {
                     && let Err(e) = connection.flush(peer_fd)
                 {
                     warn!(fd = peer_fd, peer_fd = fd, %e, "connection 쓰기 실패");
-                    self.connections.remove_connection(fd);
+                    self.connections.remove_connection(fd, &mut self.kq);
                     return Ok(());
                 }
 
                 if !connection.is_buffer_full(fd) && !connection.is_eof(fd) {
-                    connection.enable_read(&self.kq, fd)?;
+                    connection.enable_read(&mut self.kq, fd);
                 } else {
-                    connection.disable_read(&self.kq, fd)?;
+                    connection.disable_read(&mut self.kq, fd);
                 }
 
-                update_write_interest(connection, &self.kq, fd)?;
+                update_write_interest(connection, &mut self.kq, fd);
             }
             ReadResult::Eof => {
-                connection.mark_eof(&self.kq, fd)?;
+                connection.mark_eof(&mut self.kq, fd);
 
                 if let Err(e) = connection.flush(peer_fd) {
                     warn!(fd, peer_fd, %e, "connection 쓰기 실패");
-                    self.connections.remove_connection(fd);
+                    self.connections.remove_connection(fd, &mut self.kq);
                     return Ok(());
                 }
 
-                update_write_interest(connection, &self.kq, fd)?;
+                update_write_interest(connection, &mut self.kq, fd);
 
                 if !connection.has_pending_data(fd) {
                     connection.shutdown_write(peer_fd)?;
                 }
 
                 if connection.is_finished() {
-                    self.connections.remove_connection(fd);
+                    self.connections.remove_connection(fd, &mut self.kq);
                 }
 
                 return Ok(());
@@ -251,35 +261,35 @@ impl Proxy {
                 && let Err(e) = connection.flush(fd)
             {
                 warn!(fd, peer_fd, %e, "connection 쓰기 실패");
-                self.connections.remove_connection(fd);
+                self.connections.remove_connection(fd, &mut self.kq);
                 return Ok(());
             }
 
             if !connection.is_buffer_full(peer_fd) && !connection.is_eof(peer_fd) {
-                connection.enable_read(&self.kq, peer_fd)?;
+                connection.enable_read(&mut self.kq, peer_fd);
             }
 
-            update_write_interest(connection, &self.kq, peer_fd)?;
+            update_write_interest(connection, &mut self.kq, peer_fd);
 
             if connection.is_eof(peer_fd) && !connection.has_pending_data(peer_fd) {
                 connection.shutdown_write(fd)?;
             }
 
             if connection.is_finished() {
-                self.connections.remove_connection(fd);
+                self.connections.remove_connection(fd, &mut self.kq);
             }
         } else {
             // 서버 연결시 write 이벤트 해제 후 read 이벤트 등록
             let server_fd = connection.server_fd();
             if let Err(e) = connection.finish_connect() {
                 warn!(%e, "서버 연결 실패");
-                self.connections.remove_connection(server_fd);
+                self.connections.remove_connection(server_fd, &mut self.kq);
                 return Ok(());
             }
             // info!("client 연결 {}", connection.client_addr()?);
 
-            connection.disable_write(&self.kq, server_fd)?;
-            register_connected(connection, &self.kq)?;
+            connection.disable_write(&mut self.kq, server_fd);
+            register_connected(connection, &mut self.kq);
         }
 
         Ok(())
@@ -290,11 +300,11 @@ impl Proxy {
             Connection::connect(client, self.config.upstream, self.config.buffer_size.get())?;
 
         if connection.is_connected() {
-            register_connected(&mut connection, &self.kq)?;
+            register_connected(&mut connection, &mut self.kq);
             // info!("client 연결: {}", connection.client_addr()?);
         } else {
             // server write event 등록
-            connection.enable_write(&self.kq, connection.server_fd())?;
+            connection.enable_write(&mut self.kq, connection.server_fd());
         }
 
         self.connections.insert(connection);
@@ -303,11 +313,7 @@ impl Proxy {
     }
 }
 
-fn update_write_interest(
-    connection: &mut Connection,
-    kq: &Kqueue,
-    source_fd: RawFd,
-) -> io::Result<()> {
+fn update_write_interest(connection: &mut Connection, kq: &mut Kqueue, source_fd: RawFd) {
     let target_fd = connection.peer_fd(source_fd);
 
     if connection.has_pending_data(source_fd) {
@@ -318,8 +324,7 @@ fn update_write_interest(
 }
 
 // client, server read event 등록
-fn register_connected(connection: &mut Connection, kq: &Kqueue) -> io::Result<()> {
-    connection.enable_read(kq, connection.client_fd())?;
-    connection.enable_read(kq, connection.server_fd())?;
-    Ok(())
+fn register_connected(connection: &mut Connection, kq: &mut Kqueue) {
+    connection.enable_read(kq, connection.client_fd());
+    connection.enable_read(kq, connection.server_fd());
 }
