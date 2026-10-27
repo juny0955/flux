@@ -1,16 +1,17 @@
 use std::error::Error;
 
-use flux::proxy::Proxy;
+use clap::Parser;
+use flux::{config::Config, proxy::Proxy};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const ADDR: &str = "127.0.0.1:9000";
-
 fn main() -> Result<(), Box<dyn Error>> {
+    let config = Config::parse();
     setup();
 
-    let mut proxy = Proxy::new(ADDR)?;
-    info!("listener binding completed: {ADDR}");
+    let listen = config.listen;
+    let mut proxy = Proxy::new(config)?;
+    info!(%listen, "listener binding completed");
     proxy.start()?;
 
     Ok(())
