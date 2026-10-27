@@ -1,6 +1,6 @@
 use std::{
     io::{self, Error, ErrorKind, Read, Write},
-    net::{Shutdown, TcpStream},
+    net::{Shutdown, SocketAddrV4, TcpStream},
     os::fd::{AsRawFd, FromRawFd, RawFd},
     ptr,
 };
@@ -9,8 +9,6 @@ use libc::{AF_INET, IPPROTO_TCP, SOCK_STREAM};
 
 use crate::kqueue::Kqueue;
 
-const BUFFER_SIZE: usize = 16 * 1024; // 16KB
-
 #[derive(Clone, Copy)]
 enum ConnectionState {
     Connecting,
@@ -18,15 +16,15 @@ enum ConnectionState {
 }
 
 struct Buffer {
-    data: [u8; BUFFER_SIZE],
+    data: Vec<u8>,
     read_pos: usize,
     write_pos: usize,
 }
 
 impl Buffer {
-    pub fn new() -> Self {
+    pub fn new(buffer_size: usize) -> Self {
         Self {
-            data: [0u8; BUFFER_SIZE],
+            data: vec![0; buffer_size],
             read_pos: 0,
             write_pos: 0,
         }
@@ -44,11 +42,15 @@ impl Buffer {
     }
 
     pub fn is_full(&self) -> bool {
-        self.write_pos - self.read_pos == BUFFER_SIZE
+        self.write_pos - self.read_pos == self.buffer_size()
     }
 
     pub fn is_empty(&self) -> bool {
         self.read_pos == self.write_pos
+    }
+
+    pub fn buffer_size(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -134,17 +136,21 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn connect(client: TcpStream) -> io::Result<Self> {
+    pub fn connect(
+        client: TcpStream,
+        upstream: SocketAddrV4,
+        buffer_size: usize,
+    ) -> io::Result<Self> {
         client.set_nonblocking(true)?;
 
-        let (server, state) = connect_server()?;
+        let (server, state) = connect_server(upstream)?;
 
         Ok(Self {
             client: Endpoint::new(client),
             server: Endpoint::new(server),
             state,
-            upstream_buffer: Buffer::new(),
-            downstream_buffer: Buffer::new(),
+            upstream_buffer: Buffer::new(buffer_size),
+            downstream_buffer: Buffer::new(buffer_size),
         })
     }
 
@@ -173,10 +179,10 @@ impl Connection {
             (&mut self.server, &mut self.downstream_buffer)
         };
 
-        if buffer.write_pos == BUFFER_SIZE {
+        if buffer.write_pos == buffer.buffer_size() {
             buffer.compact();
         }
-        if buffer.write_pos == BUFFER_SIZE {
+        if buffer.write_pos == buffer.buffer_size() {
             return Ok(ReadResult::BufferFull);
         }
 
@@ -226,7 +232,7 @@ impl Connection {
         }
 
         buffer.read_pos += n;
-        
+
         if buffer.is_empty() {
             buffer.read_pos = 0;
             buffer.write_pos = 0;
@@ -340,7 +346,7 @@ impl Connection {
     }
 }
 
-fn connect_server() -> io::Result<(TcpStream, ConnectionState)> {
+fn connect_server(upstream: SocketAddrV4) -> io::Result<(TcpStream, ConnectionState)> {
     unsafe {
         // server 소켓 생성
         let server_fd = libc::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -355,9 +361,9 @@ fn connect_server() -> io::Result<(TcpStream, ConnectionState)> {
         let addr = libc::sockaddr_in {
             sin_len: u8::try_from(addr_len).map_err(io::Error::other)?,
             sin_family: libc::sa_family_t::try_from(AF_INET).map_err(io::Error::other)?,
-            sin_port: 8080_u16.to_be(),
+            sin_port: upstream.port().to_be(),
             sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                s_addr: u32::from_ne_bytes(upstream.ip().octets()),
             },
             sin_zero: [0; 8],
         };

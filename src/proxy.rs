@@ -11,6 +11,7 @@ use libc::kevent;
 use tracing::warn;
 
 use crate::{
+    config::Config,
     connection::{Connection, ReadResult},
     kqueue::Kqueue,
 };
@@ -62,20 +63,22 @@ impl ConnectionStore {
 }
 
 pub struct Proxy {
+    config: Config,
     kq: Kqueue,
     listener: TcpListener,
     connections: ConnectionStore,
 }
 
 impl Proxy {
-    pub fn new(addr: &str) -> Result<Self, Box<dyn Error>> {
-        let listener = TcpListener::bind(addr)?;
+    pub fn new(config: Config) -> Result<Self, Box<dyn Error>> {
+        let listener = TcpListener::bind(config.listen)?;
         listener.set_nonblocking(true)?;
 
         let kq = Kqueue::new()?;
         kq.enable_read(listener.as_raw_fd())?;
 
         Ok(Self {
+            config,
             listener,
             kq,
             connections: ConnectionStore::new(),
@@ -283,7 +286,8 @@ impl Proxy {
     }
 
     fn new_connection(&mut self, client: TcpStream) -> io::Result<()> {
-        let mut connection = Connection::connect(client)?;
+        let mut connection =
+            Connection::connect(client, self.config.upstream, self.config.buffer_size.get())?;
 
         if connection.is_connected() {
             register_connected(&mut connection, &self.kq)?;
